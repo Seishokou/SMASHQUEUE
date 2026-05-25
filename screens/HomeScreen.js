@@ -1,9 +1,9 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { SafeAreaView, ScrollView, StyleSheet, Text, View } from 'react-native';
 import { BlurView } from 'expo-blur';
+import { useIsFocused } from '@react-navigation/native';
 import { Clock3, Flame, UsersRound } from 'lucide-react-native';
 
-import { useSmashQueue } from '../src/hooks/useSmashQueue';
 import BackgroundShuttle from './BackgroundShuttle';
 
 const sampleCourts = [
@@ -13,14 +13,17 @@ const sampleCourts = [
   { id: 4, court_number: 4, status: 'available', active_players: [] },
 ];
 
-export default function HomeScreen() {
-  const { courts: liveCourts, queue } = useSmashQueue();
+export default function HomeScreen({ smashQueueData }) {
+  const isFocused = useIsFocused();
+  const { courts: liveCourts = [], queue = [] } = smashQueueData ?? {};
   const [now, setNow] = useState(Date.now());
 
   useEffect(() => {
+    if (!isFocused) return undefined;
+
     const timer = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(timer);
-  }, []);
+  }, [isFocused]);
 
   const waitingPlayers = useMemo(
     () => queue.filter((entry) => entry.status === 'waiting' || entry.player?.current_status === 'waiting'),

@@ -19,7 +19,11 @@ const smashQueueTheme = {
 
 export default function App() {
   const [splashDone, setSplashDone] = useState(false);
-  const handleSplashFinish = useCallback(() => setSplashDone(true), []);
+  const [initialSession, setInitialSession] = useState(null);
+  const handleSplashFinish = useCallback((session) => {
+    setInitialSession(session ?? null);
+    setSplashDone(true);
+  }, []);
 
   if (!splashDone) {
     return (
@@ -33,7 +37,7 @@ export default function App() {
   return (
     <NavigationContainer theme={smashQueueTheme}>
       <StatusBar style="light" />
-      <HomeNavigator />
+      <HomeNavigator initialAuthChecked initialSession={initialSession} />
     </NavigationContainer>
   );
 }

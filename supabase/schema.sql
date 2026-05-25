@@ -391,6 +391,11 @@ on public.players_queue for update
 using (true)
 with check (true);
 
+drop policy if exists "public players queue delete" on public.players_queue;
+create policy "public players queue delete"
+on public.players_queue for delete
+using (true);
+
 drop policy if exists "public match history read" on public.match_history;
 create policy "public match history read"
 on public.match_history for select

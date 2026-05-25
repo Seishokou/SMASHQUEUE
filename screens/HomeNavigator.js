@@ -1,6 +1,5 @@
 import React, { useEffect, useState } from 'react';
 import { ActivityIndicator, Platform, StyleSheet, Text, View } from 'react-native';
-import { BlurView } from 'expo-blur';
 import { createBottomTabNavigator } from '@react-navigation/bottom-tabs';
 import { createNativeStackNavigator } from '@react-navigation/native-stack';
 import { CalendarDays, Home, UserRound, UsersRound } from 'lucide-react-native';
@@ -19,19 +18,25 @@ const Tab = createBottomTabNavigator();
 const Stack = createNativeStackNavigator();
 
 function MainTabs({ user }) {
-  const { players } = useSmashQueue();
+  const smashQueueData = useSmashQueue();
+  const { players } = smashQueueData;
 
   return (
     <Tab.Navigator
+      detachInactiveScreens={false}
       initialRouteName="Home"
       screenOptions={{
+        freezeOnBlur: true,
         headerShown: false,
+        lazy: false,
+        sceneContainerStyle: styles.sceneContainer,
         tabBarActiveTintColor: '#E7D773',
+        tabBarHideOnKeyboard: true,
         tabBarInactiveTintColor: '#AFAFAF',
         tabBarLabelStyle: styles.tabLabel,
         tabBarStyle: styles.tabBar,
         tabBarBackground: () => (
-          <BlurView intensity={30} tint="dark" style={StyleSheet.absoluteFill} />
+          <View pointerEvents="none" style={styles.tabBarSolid} />
         ),
       }}
     >
@@ -41,7 +46,7 @@ function MainTabs({ user }) {
           tabBarIcon: ({ color, size }) => <Home color={color} size={size} />,
         }}
       >
-        {() => <HomeScreen />}
+        {() => <HomeScreen smashQueueData={smashQueueData} />}
       </Tab.Screen>
 
       <Tab.Screen
@@ -85,9 +90,9 @@ function MainTabs({ user }) {
   );
 }
 
-export default function HomeNavigator() {
-  const [session, setSession] = useState(null);
-  const [authLoading, setAuthLoading] = useState(true);
+export default function HomeNavigator({ initialAuthChecked = false, initialSession = null }) {
+  const [session, setSession] = useState(initialSession);
+  const [authLoading, setAuthLoading] = useState(!initialAuthChecked);
 
   useEffect(() => {
     let mounted = true;
@@ -100,7 +105,6 @@ export default function HomeNavigator() {
     }
 
     supabase.auth.getSession().then(({ data, error }) => {
-      if (!mounted) return;
       if (error) {
         setSession(null);
       } else {
@@ -152,6 +156,9 @@ export default function HomeNavigator() {
 }
 
 const styles = StyleSheet.create({
+  sceneContainer: {
+    backgroundColor: '#121212',
+  },
   authLoading: {
     alignItems: 'center',
     backgroundColor: '#121212',
@@ -166,15 +173,19 @@ const styles = StyleSheet.create({
     marginTop: 14,
   },
   tabBar: {
-    backgroundColor: 'rgba(33,33,33,0.78)',
+    backgroundColor: 'rgba(33,33,33,0.96)',
     borderColor: 'rgba(255,255,255,0.12)',
     borderTopWidth: 1,
-    elevation: 0,
+    elevation: 8,
     height: Platform.select({ ios: 86, android: 74, default: 74 }),
     overflow: 'hidden',
     paddingBottom: Platform.select({ ios: 22, android: 10, default: 10 }),
     paddingTop: 8,
     position: 'absolute',
+  },
+  tabBarSolid: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: 'rgba(33,33,33,0.96)',
   },
   tabLabel: {
     fontSize: 10,

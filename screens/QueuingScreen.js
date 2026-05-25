@@ -15,7 +15,8 @@ import {
   View,
 } from 'react-native';
 import { BlurView } from 'expo-blur';
-import { CircleCheck, Clock3, History, Plus, Swords, Trophy, X } from 'lucide-react-native';
+import { useIsFocused } from '@react-navigation/native';
+import { CircleCheck, Clock3, History, Plus, Swords, Trash2, Trophy, X } from 'lucide-react-native';
 
 import { isSupabaseConfigured, supabase } from '../supabase/supabaseConfig';
 import AnimatedActionButton from './AnimatedActionButton';
@@ -23,6 +24,7 @@ import BackgroundShuttle from './BackgroundShuttle';
 
 const skills = ['Beg', 'Int', 'Adv'];
 const courtNumbers = [1, 2, 3, 4];
+const matchDurationMinutes = 1;
 const initialDemoQueue = [
   { id: 'demo-1', player_name: 'Cleric', skill_level: 'Adv', status: 'waiting', created_at: new Date().toISOString() },
   { id: 'demo-2', player_name: 'Nicole', skill_level: 'Beg', status: 'waiting', created_at: new Date().toISOString() },
@@ -36,11 +38,12 @@ const initialDemoCourts = courtNumbers.map((courtNumber) => ({
   status: 'Available',
   assigned_player_ids: [],
   assigned_player_names: [],
-  match_duration_minutes: 20,
+  match_duration_minutes: matchDurationMinutes,
   match_started_at: null,
 }));
 
 export default function QueuingScreen({ navigation }) {
+  const isFocused = useIsFocused();
   const [playerName, setPlayerName] = useState('');
   const [skillLevel, setSkillLevel] = useState('Beg');
   const [queue, setQueue] = useState(isSupabaseConfigured ? [] : initialDemoQueue);
@@ -51,9 +54,12 @@ export default function QueuingScreen({ navigation }) {
   const [teamAScore, setTeamAScore] = useState('');
   const [teamBScore, setTeamBScore] = useState('');
   const [clearedAt, setClearedAt] = useState(null);
+  const [deletingQueueId, setDeletingQueueId] = useState(null);
   const [now, setNow] = useState(Date.now());
   const channelNameRef = useRef(`book-court-live-${Date.now()}-${Math.random().toString(36).slice(2)}`);
   const assigningRef = useRef(false);
+  const hasLoadedRef = useRef(!isSupabaseConfigured);
+  const refreshTimerRef = useRef(null);
 
   const waitingQueue = useMemo(
     () => queue.filter((player) => player.status === 'waiting'),
@@ -69,16 +75,18 @@ export default function QueuingScreen({ navigation }) {
         status: 'Available',
         assigned_player_ids: [],
         assigned_player_names: [],
-        match_duration_minutes: 20,
+        match_duration_minutes: matchDurationMinutes,
         match_started_at: null,
       }
     ));
   }, [courts]);
 
-  const fetchBookData = useCallback(async () => {
+  const fetchBookData = useCallback(async ({ showLoader = false } = {}) => {
     if (!supabase) return;
 
-    setLoading(true);
+    if (showLoader || !hasLoadedRef.current) {
+      setLoading(true);
+    }
 
     try {
       const [queueResponse, courtsResponse] = await Promise.all([
@@ -96,8 +104,24 @@ export default function QueuingScreen({ navigation }) {
       if (queueResponse.error) throw queueResponse.error;
       if (courtsResponse.error) throw courtsResponse.error;
 
-      setQueue(queueResponse.data ?? []);
+      setQueue((current) => {
+        const pendingPlayers = current.filter((player) => player.is_pending);
+        const remotePlayers = queueResponse.data ?? [];
+        const pendingNotSynced = pendingPlayers.filter(
+          (pendingPlayer) =>
+            !remotePlayers.some(
+              (remotePlayer) =>
+                remotePlayer.player_name === pendingPlayer.player_name &&
+                remotePlayer.skill_level === pendingPlayer.skill_level
+            )
+        );
+
+        return [...remotePlayers, ...pendingNotSynced].sort(
+          (first, second) => new Date(first.created_at).getTime() - new Date(second.created_at).getTime()
+        );
+      });
       setCourts(courtsResponse.data ?? []);
+      hasLoadedRef.current = true;
     } catch (error) {
       Alert.alert('Could not load Book Court', getErrorMessage(error));
     } finally {
@@ -106,44 +130,61 @@ export default function QueuingScreen({ navigation }) {
   }, []);
 
   useEffect(() => {
-    fetchBookData();
+    fetchBookData({ showLoader: true });
   }, [fetchBookData]);
 
   useEffect(() => {
     if (!supabase) return;
+
+    const scheduleRefresh = () => {
+      if (refreshTimerRef.current) {
+        clearTimeout(refreshTimerRef.current);
+      }
+
+      refreshTimerRef.current = setTimeout(() => {
+        void fetchBookData();
+      }, 180);
+    };
 
     const channel = supabase
       .channel(channelNameRef.current)
       .on(
         'postgres_changes',
         { event: '*', schema: 'public', table: 'players_queue' },
-        () => void fetchBookData()
+        scheduleRefresh
       )
       .on(
         'postgres_changes',
         { event: '*', schema: 'public', table: 'courts' },
-        () => void fetchBookData()
+        scheduleRefresh
       )
       .subscribe();
 
     return () => {
+      if (refreshTimerRef.current) {
+        clearTimeout(refreshTimerRef.current);
+      }
       void supabase.removeChannel(channel);
     };
   }, [fetchBookData]);
 
   useEffect(() => {
+    if (!isFocused) return undefined;
+
     const timer = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(timer);
-  }, []);
+  }, [isFocused]);
 
   useEffect(() => {
     const firstAvailableCourt = orderedCourts.find((court) => isCourtAvailable(court));
-    if (!firstAvailableCourt || waitingQueue.length < 4 || assigningRef.current) {
+    const nextSkillGroup = findNextSkillMatchedGroup(waitingQueue);
+
+    if (!firstAvailableCourt || !nextSkillGroup || assigningRef.current) {
       return;
     }
 
     assigningRef.current = true;
-    void autoAssignCourt(firstAvailableCourt, waitingQueue.slice(0, 4)).finally(() => {
+    void autoAssignCourt(firstAvailableCourt, nextSkillGroup).finally(() => {
       assigningRef.current = false;
     });
   }, [orderedCourts, waitingQueue]);
@@ -165,7 +206,18 @@ export default function QueuingScreen({ navigation }) {
       return;
     }
 
+    const createdAt = new Date().toISOString();
+    const optimisticPlayer = {
+      id: `pending-${Date.now()}`,
+      player_name: trimmedName,
+      skill_level: skillLevel,
+      status: 'waiting',
+      created_at: createdAt,
+      is_pending: true,
+    };
+
     setJoining(true);
+    setPlayerName('');
 
     try {
       if (!supabase) {
@@ -176,31 +228,98 @@ export default function QueuingScreen({ navigation }) {
             player_name: trimmedName,
             skill_level: skillLevel,
             status: 'waiting',
-            created_at: new Date().toISOString(),
+            created_at: createdAt,
           },
         ]);
-        setPlayerName('');
         return;
       }
 
-      const { error } = await supabase.from('players_queue').insert({
-        player_name: trimmedName,
-        skill_level: skillLevel,
-        status: 'waiting',
-      });
+      setQueue((current) => [...current, optimisticPlayer]);
+
+      const { data, error } = await supabase
+        .from('players_queue')
+        .insert({
+          player_name: trimmedName,
+          skill_level: skillLevel,
+          status: 'waiting',
+        })
+        .select('id,player_name,skill_level,status,court_id,match_group_id,created_at,assigned_at,finished_at')
+        .single();
 
       if (error) throw error;
 
-      setPlayerName('');
-      await fetchBookData();
+      if (data) {
+        setQueue((current) =>
+          current
+            .map((player) => (player.id === optimisticPlayer.id ? data : player))
+            .sort((first, second) => new Date(first.created_at).getTime() - new Date(second.created_at).getTime())
+        );
+      }
+
+      void fetchBookData();
     } catch (error) {
+      setQueue((current) => current.filter((player) => player.id !== optimisticPlayer.id));
+      setPlayerName(trimmedName);
       Alert.alert('Could not join queue', getErrorMessage(error));
     } finally {
       setJoining(false);
     }
   }
 
+  function confirmDeleteQueuePlayer(player) {
+    Alert.alert(
+      'Remove player?',
+      `Delete ${player.player_name} from the waiting queue?`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Delete',
+          style: 'destructive',
+          onPress: () => void deleteQueuePlayer(player),
+        },
+      ]
+    );
+  }
+
+  async function deleteQueuePlayer(player) {
+    setDeletingQueueId(player.id);
+
+    try {
+      setQueue((current) => current.filter((queuePlayer) => queuePlayer.id !== player.id));
+
+      if (!supabase || player.is_pending) {
+        return;
+      }
+
+      const { error } = await supabase
+        .from('players_queue')
+        .delete()
+        .eq('id', player.id)
+        .eq('status', 'waiting');
+
+      if (error) throw error;
+
+      void fetchBookData();
+    } catch (error) {
+      void fetchBookData();
+      Alert.alert('Could not delete player', getErrorMessage(error));
+    } finally {
+      setDeletingQueueId(null);
+    }
+  }
+
   async function autoAssignCourt(court, players) {
+    const groupSkill = players[0]?.skill_level;
+    const hasMixedSkill = players.some((player) => player.skill_level !== groupSkill);
+
+    if (!groupSkill || players.length !== 4 || hasMixedSkill) {
+      return;
+    }
+
+    if (players.some((player) => player.is_pending)) {
+      return;
+    }
+
     const matchGroupId = createLocalUuid();
     const duration = randomDurationMinutes();
     const startedAt = new Date().toISOString();
@@ -208,34 +327,35 @@ export default function QueuingScreen({ navigation }) {
     const playerNames = players.map((player) => player.player_name);
 
     try {
+      setQueue((current) =>
+        current.map((player) =>
+          playerIds.includes(player.id)
+            ? {
+                ...player,
+                status: 'playing',
+                court_id: court.id,
+                match_group_id: matchGroupId,
+                assigned_at: startedAt,
+              }
+            : player
+        )
+      );
+      setCourts((current) =>
+        current.map((courtItem) =>
+          courtItem.id === court.id || courtItem.court_number === court.court_number
+            ? {
+                ...courtItem,
+                status: 'Occupied',
+                assigned_player_ids: playerIds,
+                assigned_player_names: playerNames,
+                match_started_at: startedAt,
+                match_duration_minutes: duration,
+              }
+            : courtItem
+        )
+      );
+
       if (!supabase) {
-        setQueue((current) =>
-          current.map((player) =>
-            playerIds.includes(player.id)
-              ? {
-                  ...player,
-                  status: 'playing',
-                  court_id: court.id,
-                  match_group_id: matchGroupId,
-                  assigned_at: startedAt,
-                }
-              : player
-          )
-        );
-        setCourts((current) =>
-          current.map((courtItem) =>
-            courtItem.id === court.id || courtItem.court_number === court.court_number
-              ? {
-                  ...courtItem,
-                  status: 'Occupied',
-                  assigned_player_ids: playerIds,
-                  assigned_player_names: playerNames,
-                  match_started_at: startedAt,
-                  match_duration_minutes: duration,
-                }
-              : courtItem
-          )
-        );
         return;
       }
 
@@ -264,8 +384,9 @@ export default function QueuingScreen({ navigation }) {
       if (playersResponse.error) throw playersResponse.error;
       if (courtResponse.error) throw courtResponse.error;
 
-      await fetchBookData();
+      void fetchBookData();
     } catch (error) {
+      void fetchBookData();
       Alert.alert('Auto-assign failed', getErrorMessage(error));
     }
   }
@@ -321,7 +442,7 @@ export default function QueuingScreen({ navigation }) {
                   assigned_player_ids: [],
                   assigned_player_names: [],
                   match_started_at: null,
-                  match_duration_minutes: 20,
+                  match_duration_minutes: matchDurationMinutes,
                 }
               : court
           )
@@ -357,7 +478,7 @@ export default function QueuingScreen({ navigation }) {
             assigned_player_ids: [],
             assigned_player_names: [],
             match_started_at: null,
-            match_duration_minutes: 20,
+            match_duration_minutes: matchDurationMinutes,
           })
           .eq('id', selectedCourt.id),
       ]);
@@ -457,7 +578,14 @@ export default function QueuingScreen({ navigation }) {
               <FlatList
                 data={waitingQueue}
                 keyExtractor={(item) => item.id}
-                renderItem={({ item, index }) => <QueueRow item={item} rank={index + 1} />}
+                renderItem={({ item, index }) => (
+                  <QueueRow
+                    deleting={deletingQueueId === item.id}
+                    item={item}
+                    onDelete={() => confirmDeleteQueuePlayer(item)}
+                    rank={index + 1}
+                  />
+                )}
                 scrollEnabled={false}
                 ListEmptyComponent={<Text style={styles.emptyText}>No players are waiting.</Text>}
               />
@@ -502,7 +630,7 @@ export default function QueuingScreen({ navigation }) {
   );
 }
 
-function QueueRow({ item, rank }) {
+function QueueRow({ deleting, item, onDelete, rank }) {
   return (
     <View style={styles.queueRow}>
       <View style={styles.rankBubble}>
@@ -514,9 +642,24 @@ function QueueRow({ item, rank }) {
         <Text style={styles.playerMeta}>{item.skill_level}</Text>
       </View>
 
-      <View style={styles.waitBadge}>
-        <Swords color="#E7D773" size={18} />
-        <Text style={styles.waitBadgeText}>Wait</Text>
+      <View style={styles.queueActions}>
+        <View style={styles.waitBadge}>
+          <Swords color="#E7D773" size={17} />
+          <Text style={styles.waitBadgeText}>Wait</Text>
+        </View>
+
+        <Pressable
+          accessibilityLabel={`Delete ${item.player_name} from queue`}
+          disabled={deleting}
+          onPress={onDelete}
+          style={[styles.deleteQueueButton, deleting && styles.deleteQueueButtonDisabled]}
+        >
+          {deleting ? (
+            <ActivityIndicator color="#FF8B96" size="small" />
+          ) : (
+            <Trash2 color="#FF8B96" size={18} />
+          )}
+        </Pressable>
       </View>
     </View>
   );
@@ -648,11 +791,33 @@ function isCourtAvailable(court) {
   return ['available', 'Available', 'open', 'Open'].includes(court.status);
 }
 
+function findNextSkillMatchedGroup(players) {
+  const completeGroups = skills
+    .map((skill) => {
+      const group = players.filter((player) => player.skill_level === skill).slice(0, 4);
+      return group.length === 4 ? group : null;
+    })
+    .filter(Boolean);
+
+  if (!completeGroups.length) return null;
+
+  return completeGroups.sort((firstGroup, secondGroup) => {
+    const firstCompletedAt = new Date(firstGroup[3].created_at).getTime();
+    const secondCompletedAt = new Date(secondGroup[3].created_at).getTime();
+
+    if (firstCompletedAt !== secondCompletedAt) {
+      return firstCompletedAt - secondCompletedAt;
+    }
+
+    return skills.indexOf(firstGroup[0].skill_level) - skills.indexOf(secondGroup[0].skill_level);
+  })[0];
+}
+
 function getCountdown(court, now) {
-  if (!court.match_started_at) return `${court.match_duration_minutes ?? 20}:00`;
+  if (!court.match_started_at) return `${court.match_duration_minutes ?? matchDurationMinutes}:00`;
 
   const startedAt = new Date(court.match_started_at).getTime();
-  const durationMs = (court.match_duration_minutes ?? 20) * 60 * 1000;
+  const durationMs = (court.match_duration_minutes ?? matchDurationMinutes) * 60 * 1000;
   const remainingMs = Math.max(0, startedAt + durationMs - now);
   const minutes = Math.floor(remainingMs / 60000);
   const seconds = Math.floor((remainingMs % 60000) / 1000);
@@ -661,7 +826,7 @@ function getCountdown(court, now) {
 }
 
 function randomDurationMinutes() {
-  return Math.floor(Math.random() * 11) + 15;
+  return matchDurationMinutes;
 }
 
 function getWinnerLabel(scoreA, scoreB) {
@@ -875,6 +1040,7 @@ const styles = StyleSheet.create({
   },
   queueCopy: {
     flex: 1,
+    minWidth: 0,
   },
   playerName: {
     color: '#F5F5F5',
@@ -891,14 +1057,32 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(255,255,255,0.09)',
     borderRadius: 18,
     flexDirection: 'row',
-    gap: 7,
+    gap: 6,
     minHeight: 42,
-    paddingHorizontal: 12,
+    paddingHorizontal: 10,
   },
   waitBadgeText: {
     color: '#F2F2F2',
-    fontSize: 16,
+    fontSize: 14,
     fontWeight: '900',
+  },
+  queueActions: {
+    alignItems: 'center',
+    flexDirection: 'row',
+    gap: 8,
+  },
+  deleteQueueButton: {
+    alignItems: 'center',
+    backgroundColor: 'rgba(255,139,150,0.13)',
+    borderColor: 'rgba(255,139,150,0.28)',
+    borderRadius: 17,
+    borderWidth: 1,
+    height: 42,
+    justifyContent: 'center',
+    width: 42,
+  },
+  deleteQueueButtonDisabled: {
+    opacity: 0.62,
   },
   courtRow: {
     alignItems: 'center',
